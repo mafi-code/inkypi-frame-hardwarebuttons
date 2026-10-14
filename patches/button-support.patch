@@ -1,0 +1,1039 @@
+diff --git a/docs/BUTTONS.md b/docs/BUTTONS.md
+new file mode 100644
+index 0000000..0ef7c79
+--- /dev/null
++++ b/docs/BUTTONS.md
+@@ -0,0 +1,256 @@
++# Hardware Buttons (A/B/C/D)
++
++InkyPi does not support the 4 physical buttons on the Pimoroni Inky Impression out
++of the box. The only related work upstream is [PR #686](https://github.com/fatihak/InkyPi/pull/686),
++which is unmerged and only wires up button A. This document describes the local
++patch that adds all 4 buttons, based on that PR's approach.
++
++## What each button does
++
++| Button | GPIO | Action |
++|---|---|---|
++| A | 5  | Cycle to the **next** plugin in the active playlist |
++| B | 6  | Cycle to the **previous** plugin in the active playlist |
++| C | 16 | Force-refresh the **current** plugin (re-render without advancing) |
++| D | 24 | **Pause/resume** automatic interval-based playlist cycling |
++
++Pausing (D) only stops the automatic timer-based advance — A/B/C still work
++normally while paused. Any button can also be set to **"Go to playlist/plugin..."**
++instead of the actions above:
++
++- **Jump to a specific plugin instance** (e.g. always show "Weather: Berlin"),
++  regardless of where the playlist's cycle position currently is.
++- **Jump to a plugin type**, generically — e.g. "always show Clock", without
++  caring which named instance. If an instance of that type already exists in
++  the target playlist, it's reused; otherwise one is created on the fly with
++  default settings (empty `settings`/`refresh` dicts) and a name derived from
++  the plugin's `display_name` (de-duplicated with a `(2)`, `(3)`, ... suffix
++  if that name is already taken). The list of plugin types is read from
++  whatever is actually installed under `src/plugins/` at request time
++  (`device_config.get_plugins()`), so custom-installed plugins show up
++  automatically — nothing is hardcoded.
++- **Switch to a different playlist**, overriding the time-based schedule.
++  This *pins* that playlist as active until another playlist-switch happens
++  (button press, or another `switch_to_playlist` call) — it does not
++  auto-revert to the schedule on its own.
++
++## Configuring via the dashboard
++
++The **Settings** page has a "Hardware Buttons" section (only shown when
++`display_type` is `inky`) where each button's action can be changed via a
++dropdown (Next plugin / Previous plugin / Refresh current / Pause-resume /
++**Go to playlist/plugin...** / Do nothing), plus a numeric field for the
++debounce time. When "Go to..." is selected, a second dropdown appears,
++grouped by playlist (`<optgroup>`), listing:
++- "Whole playlist (auto-cycle)"
++- one entry per already-configured plugin instance in that playlist
++- one **"+ New `<Plugin Type>`"** entry per installed plugin type (all ~20
++  built-in ones, plus any custom-installed plugins)
++
++All of this takes effect **immediately** — no service restart needed, since
++`button_task.py` reads `button_actions` and `button_debounce_seconds` from
++config on every button press rather than caching them at startup.
++
++GPIO pin assignments are **not** exposed in the dashboard, since
++`_request_button_lines()` only requests the GPIO lines once when the button
++thread starts — changing a pin requires a restart to take effect, unlike the
++action mapping and debounce. They can still be set manually in `device.json`:
++
++```json
++{
++  "button_a_gpio": 5,
++  "button_b_gpio": 6,
++  "button_c_gpio": 16,
++  "button_d_gpio": 24,
++  "button_actions": {
++    "a": "next",
++    "b": "previous",
++    "c": "refresh",
++    "d": "pause"
++  },
++  "button_debounce_seconds": 1.0
++}
++```
++
++Each entry in `button_actions` is either a plain string (`next`, `previous`,
++`refresh`, `pause`, `none`) or, for "go to" actions, a small object:
++
++```json
++{
++  "button_actions": {
++    "a": {"type": "plugin", "playlist": "Default", "plugin_id": "weather", "instance": "Berlin"},
++    "b": {"type": "playlist", "playlist": "Evening"},
++    "c": {"type": "plugin_type", "playlist": "Default", "plugin_id": "clock"}
++  }
++}
++```
++
++## Files changed
++
++All paths relative to `InkyPi/src/`.
++
++### `button_task.py` (new)
++
++New `ButtonTask` class, modeled on PR #686's `ButtonTask` but extended to watch
++all 4 GPIO lines instead of just one:
++
++- Uses `gpiod` + `gpiodevice` (already installed as InkyPi dependencies) to
++  request all 4 lines in one call, `Bias.PULL_UP` + `Edge.FALLING`.
++- Runs in its own daemon thread, polling for edge events (`wait_edge_events`
++  when available, falling back to a sleep loop otherwise).
++- Per-button debounce (default 1s, configurable, read live from config on
++  every press).
++- Looks up each button's configured action from `button_actions` (defaulting
++  to a=next, b=previous, c=refresh, d=pause if unset). An action is either a
++  plain string dispatched to `refresh_task.cycle_playlist_next()` /
++  `cycle_playlist_previous()` / `force_refresh_current()` / `toggle_pause()`
++  (`none` is a no-op), or a dict with `"type": "plugin"` / `"type": "plugin_type"` /
++  `"type": "playlist"` dispatched to `refresh_task.jump_to_plugin(...)` /
++  `refresh_task.jump_to_plugin_type(...)` / `refresh_task.switch_to_playlist(...)`.
++- `is_enabled()` gates on `display_type == "inky"` (default), so it's a no-op
++  on Waveshare setups.
++
++### `refresh_task.py`
++
++`RefreshTask` gained 3 new public methods and one new internal branch in the
++worker loop, mirroring the existing `manual_update()` pattern (condition
++variable + wake the background thread):
++
++- `cycle_playlist_next(wait=False)` / `cycle_playlist_previous(wait=False)`
++  → set `self.playlist_cycle_direction` and wake the thread. The thread then
++  calls `_determine_next_plugin(..., ignore_cycle_interval=True, reverse=...)`
++  so the button press always takes effect immediately, regardless of the
++  configured `plugin_cycle_interval_seconds`.
++- `force_refresh_current(wait=False)` → sets `self.force_refresh_requested`;
++  the thread re-renders whatever plugin is at the playlist's
++  `current_plugin_index` with `force=True` (bypasses the plugin's own
++  `should_refresh()` check), without advancing the index.
++- `toggle_pause()` → flips `self.paused` and returns the new state. When
++  `paused`, the periodic interval-check branch is skipped; the
++  manual/button-triggered branches are unaffected.
++- `_determine_next_plugin()` gained two new parameters:
++  `ignore_cycle_interval` (skip the "is it time yet" check) and `reverse`
++  (call `get_previous_plugin()` instead of `get_next_plugin()`).
++- `jump_to_plugin(playlist_name, plugin_id, instance_name, wait=False)` → sets
++  `self.jump_target`; the thread looks up the playlist, calls
++  `playlist.set_current_plugin(...)` to both find the instance and update
++  `current_plugin_index` to point at it, then force-refreshes it.
++- `jump_to_plugin_type(playlist_name, plugin_id, wait=False)` → sets
++  `self.jump_type_target`; the thread looks for an existing instance of that
++  plugin_id in the playlist. If found, jumps to it like `jump_to_plugin`. If
++  not, looks up the plugin's config via `device_config.get_plugin(plugin_id)`,
++  builds a new `PluginInstance(plugin_id, name, {}, {})` (empty
++  settings/refresh — whatever the plugin does with no config, e.g. Clock and
++  Year Progress need none; others may error until configured properly via the
++  normal playlist UI), appends it to `playlist.plugins`, and force-refreshes
++  it. The instance name is `_unique_instance_name(playlist, display_name)` —
++  the plugin's `display_name`, de-duplicated against existing instance names
++  in that playlist with a `(2)`, `(3)`, ... suffix if needed.
++- `switch_to_playlist(playlist_name, wait=False)` → sets
++  `self.playlist_switch_target`; the thread sets
++  `playlist_manager.pinned_playlist` to that name (see `model.py` below) and
++  immediately refreshes whatever plugin that playlist's `_determine_next_plugin`
++  resolves to.
++
++### `model.py`
++
++- `Playlist` gained `get_previous_plugin()`, a mirror of the existing
++  `get_next_plugin()` but decrementing `current_plugin_index` (with
++  wraparound) instead of incrementing it.
++- `Playlist` gained `set_current_plugin(plugin_id, name)`, which finds a
++  plugin instance by id+name, sets `current_plugin_index` to point at it, and
++  returns it (or `None` if not found) — used by the "jump to plugin" button
++  action.
++- `PlaylistManager` gained a `pinned_playlist` attribute (persisted via
++  `to_dict`/`from_dict`). When set, `determine_active_playlist()` returns
++  that playlist directly instead of doing the time-window/priority lookup —
++  this is what makes the "switch to playlist" button action override the
++  schedule. It is *not* auto-cleared; switching to another playlist (or
++  editing `device.json` directly) is what changes it. If the pinned playlist
++  no longer exists (e.g. deleted), it's cleared automatically and normal
++  schedule-based selection resumes.
++
++### `inkypi.py`
++
++Wired `ButtonTask` into the app lifecycle exactly like `RefreshTask`:
++instantiated alongside it, started after `refresh_task.start()`, stopped
++before `refresh_task.stop()` in the `finally` block, and exposed via
++`app.config['BUTTON_TASK']` for consistency (not currently used by any route).
++
++### `blueprints/settings.py`
++
++`settings_page()` now also builds:
++- `playlists_for_buttons` — a list of `{name, plugins: [{plugin_id, instance,
++  display_name}]}` per playlist (using `device_config.get_plugin(id).display_name`
++  for a human-readable label).
++- `all_plugin_types` — `[{plugin_id, display_name}, ...]` for *every* plugin
++  `settings_page()` finds via `device_config.get_plugins()`, which itself
++  dynamically scans `src/plugins/*/plugin-info.json` on every config load —
++  nothing is hardcoded, so custom-installed plugins appear automatically.
++
++Both are passed to the template so the "go to" target dropdown can be
++populated.
++
++`save_settings()` gained two new optional blocks, following the same
++"only touch this key if its field was present in the form" pattern already
++used for `inky_saturation`:
++
++- If `button_a_action` is present, all 4 `button_{a,b,c,d}_action` fields are
++  read and validated against `VALID_BUTTON_ACTIONS`
++  (`{next, previous, refresh, pause, goto, none}`). For `goto`, the matching
++  `button_{btn}_target` field is parsed into the appropriate dict shape
++  described above:
++  - `playlist|<name>` → `{"type": "playlist", ...}`
++  - `plugin|<playlist>|<plugin_id>|<instance>` → `{"type": "plugin", ...}`
++  - `plugintype|<playlist>|<plugin_id>` → `{"type": "plugin_type", ...}`
++
++  Any other action value is saved as the plain string.
++- If `button_debounce_seconds` is present, it's parsed as a float, validated
++  to be `>= 0`, and saved as-is.
++
++### `templates/settings.html`
++
++Added a new "Hardware Buttons" collapsible section (same pattern/CSS classes
++as the existing "Image Settings" collapsible), shown only when
++`display_type` is `inky`. Built with a `{% for %}` loop over the 4 buttons
++(same pattern already used elsewhere in this template, e.g. for timezones):
++per button, an action `<select>` (`.button-action-select`) and a paired
++target `<select>`, grouped by playlist via `<optgroup>` with: one option for
++"whole playlist", one per already-configured plugin instance, and one
++**"+ New `<Plugin Type>`"** per entry in `all_plugin_types` (looped with a
++nested `{% for %}` inside each playlist's `<optgroup>`) — the currently-saved
++value is matched back to `selected` by re-encoding it the same way
++(`playlist|...` / `plugin|...` / `plugintype|...`) and comparing strings.
++Plus one plain number input for the debounce seconds, shared across all 4
++buttons.
++
++Two small JS additions (`updateButtonTargetVisibility` /
++`initButtonTargetVisibility`) show/hide each target select based on whether
++its action select is set to `goto` — purely cosmetic, since `FormData` submits
++hidden fields too, so the existing save logic didn't need any changes.
++
++## Known gotchas hit during setup
++
++These aren't about the buttons directly, but were required to get the device
++into a working state first — noted here since they're easy to hit again after
++a re-flash or re-install:
++
++- **`install/install.sh` race condition**: the script's "install system
++  dependencies" step (apt-get, includes `python3-dev`) doesn't reliably finish
++  before the "install python dependencies" step starts, so `spidev` can fail
++  to build (`fatal error: Python.h: No such file or directory`) even though
++  the script reports "Installation Complete". Fix: re-run
++  `sudo /usr/local/inkypi/venv_inkypi/bin/pip install -r install/requirements.txt`
++  once `python3-dev` is confirmed installed (`dpkg -s python3-dev`).
++- **`earlyoom.service` fails to install**: same root cause — a concurrent
++  apt-get holds the dpkg lock. Re-run
++  `sudo apt-get install -y earlyoom && sudo systemctl enable --now earlyoom`
++  afterwards if you see `Failed to enable unit: Unit earlyoom.service does not exist`.
++- **Display crashes with `Chip Select: (line 8, GPIO8) currently claimed by spi0 CS0`**:
++  the install script's single-CS SPI overlay (`dtoverlay=spi0-0cs` in
++  `/boot/firmware/config.txt`) only takes effect after a **reboot**. If you
++  decline the script's reboot prompt, the Inky library can't claim GPIO8 until
++  you reboot manually.
++- **Buttons detected but nothing happens**: check that the active playlist
++  actually has plugins in it (`playlist_config.playlists[].plugins` in
++  `device.json`) — A/B/C need something to cycle through or refresh.
+diff --git a/src/blueprints/settings.py b/src/blueprints/settings.py
+index 6f3c013..9018e9c 100644
+--- a/src/blueprints/settings.py
++++ b/src/blueprints/settings.py
+@@ -25,11 +25,43 @@ except ImportError:
+ logger = logging.getLogger(__name__)
+ settings_bp = Blueprint("settings", __name__)
+ 
++VALID_BUTTON_ACTIONS = {"next", "previous", "refresh", "pause", "goto", "none"}
++
+ @settings_bp.route('/settings')
+ def settings_page():
+     device_config = current_app.config['DEVICE_CONFIG']
+     timezones = sorted(pytz.all_timezones_set)
+-    return render_template('settings.html', device_settings=device_config.get_config(), timezones = timezones)
++
++    playlist_manager = device_config.get_playlist_manager()
++    playlists_for_buttons = [
++        {
++            "name": playlist.name,
++            "plugins": [
++                {
++                    "plugin_id": instance.plugin_id,
++                    "instance": instance.name,
++                    "display_name": (device_config.get_plugin(instance.plugin_id) or {}).get("display_name", instance.plugin_id),
++                }
++                for instance in playlist.plugins
++            ],
++        }
++        for playlist in playlist_manager.playlists
++    ]
++
++    # All currently installed plugin types (not just ones already added to a
++    # playlist) — dynamically discovered, so custom-installed plugins show up too.
++    all_plugin_types = [
++        {"plugin_id": p["id"], "display_name": p.get("display_name", p["id"])}
++        for p in device_config.get_plugins()
++    ]
++
++    return render_template(
++        'settings.html',
++        device_settings=device_config.get_config(),
++        timezones=timezones,
++        playlists_for_buttons=playlists_for_buttons,
++        all_plugin_types=all_plugin_types,
++    )
+ 
+ @settings_bp.route('/save_settings', methods=['POST'])
+ def save_settings():
+@@ -69,6 +101,47 @@ def save_settings():
+         }
+         if "inky_saturation" in form_data:
+             settings["image_settings"]["inky_saturation"] = float(form_data.get("inky_saturation", "0.5"))
++
++        if "button_a_action" in form_data:
++            button_actions = {}
++            for btn in ["a", "b", "c", "d"]:
++                action = form_data.get(f"button_{btn}_action", "none")
++                if action not in VALID_BUTTON_ACTIONS:
++                    return jsonify({"error": f"Invalid action for button {btn.upper()}"}), 400
++
++                if action == "goto":
++                    target = form_data.get(f"button_{btn}_target", "")
++                    target_parts = target.split("|")
++                    if target_parts[0] == "playlist" and len(target_parts) == 2 and target_parts[1]:
++                        button_actions[btn] = {"type": "playlist", "playlist": target_parts[1]}
++                    elif target_parts[0] == "plugin" and len(target_parts) == 4 and all(target_parts[1:]):
++                        button_actions[btn] = {
++                            "type": "plugin",
++                            "playlist": target_parts[1],
++                            "plugin_id": target_parts[2],
++                            "instance": target_parts[3],
++                        }
++                    elif target_parts[0] == "plugintype" and len(target_parts) == 3 and all(target_parts[1:]):
++                        button_actions[btn] = {
++                            "type": "plugin_type",
++                            "playlist": target_parts[1],
++                            "plugin_id": target_parts[2],
++                        }
++                    else:
++                        return jsonify({"error": f"Button {btn.upper()}: select a playlist or plugin to go to"}), 400
++                else:
++                    button_actions[btn] = action
++            settings["button_actions"] = button_actions
++
++        if "button_debounce_seconds" in form_data:
++            try:
++                button_debounce_seconds = float(form_data.get("button_debounce_seconds", "1.0"))
++            except ValueError:
++                return jsonify({"error": "Button debounce must be a number"}), 400
++            if button_debounce_seconds < 0:
++                return jsonify({"error": "Button debounce must be 0 or greater"}), 400
++            settings["button_debounce_seconds"] = button_debounce_seconds
++
+         device_config.update_config(settings)
+ 
+         if plugin_cycle_interval_seconds != previous_interval_seconds:
+diff --git a/src/button_task.py b/src/button_task.py
+new file mode 100644
+index 0000000..46e5f4f
+--- /dev/null
++++ b/src/button_task.py
+@@ -0,0 +1,177 @@
++import logging
++import threading
++import time
++from datetime import timedelta
++
++logger = logging.getLogger(__name__)
++
++
++class ButtonTask:
++    """Watches Pimoroni Inky hardware buttons (A/B/C/D) and triggers app actions.
++
++    A: next plugin in playlist
++    B: previous plugin in playlist
++    C: force-refresh the current plugin
++    D: pause/resume automatic interval-based cycling
++    """
++
++    DEFAULT_BUTTON_GPIO = {"a": 5, "b": 6, "c": 16, "d": 24}
++    DEFAULT_BUTTON_ACTIONS = {"a": "next", "b": "previous", "c": "refresh", "d": "pause"}
++    DEFAULT_DEBOUNCE_SECONDS = 1.0
++    POLL_TIMEOUT_SECONDS = 0.25
++
++    def __init__(self, device_config, refresh_task):
++        self.device_config = device_config
++        self.refresh_task = refresh_task
++        self.thread = None
++        self.running = False
++        self.request = None
++        self.offset_to_button = {}
++        self.last_press_time = {}
++
++    def start(self):
++        """Start watching buttons A-D when button controls are enabled for Inky hardware."""
++        if not self.is_enabled():
++            logger.info("Button controls disabled or unsupported for this display type")
++            return False
++
++        if self.thread and self.thread.is_alive():
++            return True
++
++        self.running = True
++        self.thread = threading.Thread(target=self._run, daemon=True)
++        self.thread.start()
++        logger.info("Started Inky button task")
++        return True
++
++    def stop(self):
++        """Stop watching button events."""
++        self.running = False
++
++        if self.thread and self.thread.is_alive():
++            logger.info("Stopping Inky button task")
++            self.thread.join(timeout=2)
++
++        if self.thread and self.thread.is_alive():
++            self._close_request()
++
++    def is_enabled(self):
++        """Return whether button controls should run for the current config."""
++        if self.device_config.get_config("display_type", default="inky") != "inky":
++            return False
++
++        return True
++
++    def _run(self):
++        try:
++            self.request, self.offset_to_button = self._request_button_lines()
++            while self.running:
++                for event in self._read_events(self.request):
++                    self._handle_button_event(event)
++        except ImportError as e:
++            logger.warning(f"Inky button controls unavailable; missing GPIO dependency: {e}")
++        except Exception:
++            logger.exception("Inky button task stopped after an unexpected error")
++        finally:
++            self.running = False
++            self._close_request()
++
++    def _request_button_lines(self):
++        import gpiod
++        import gpiodevice
++        from gpiod.line import Bias, Direction, Edge
++
++        input_settings = gpiod.LineSettings(
++            direction=Direction.INPUT,
++            bias=Bias.PULL_UP,
++            edge_detection=Edge.FALLING,
++        )
++
++        chip = gpiodevice.find_chip_by_platform()
++        offset_to_button = {}
++        for button, default_gpio in self.DEFAULT_BUTTON_GPIO.items():
++            gpio = int(self.device_config.get_config(f"button_{button}_gpio", default=default_gpio))
++            offset = chip.line_offset_from_id(gpio)
++            offset_to_button[offset] = button
++            logger.info(f"Listening for Inky button {button.upper()} on GPIO {gpio}")
++
++        line_config = dict.fromkeys(offset_to_button.keys(), input_settings)
++        request = chip.request_lines(consumer="inkypi-buttons", config=line_config)
++        return request, offset_to_button
++
++    def _read_events(self, request):
++        if hasattr(request, "wait_edge_events"):
++            if not request.wait_edge_events(timeout=timedelta(seconds=self.POLL_TIMEOUT_SECONDS)):
++                return []
++            return request.read_edge_events()
++
++        time.sleep(self.POLL_TIMEOUT_SECONDS)
++        return request.read_edge_events()
++
++    def _handle_button_event(self, event):
++        button = self.offset_to_button.get(event.line_offset)
++        if not button:
++            return
++
++        now = time.monotonic()
++        debounce_seconds = float(
++            self.device_config.get_config("button_debounce_seconds", default=self.DEFAULT_DEBOUNCE_SECONDS)
++        )
++        if now - self.last_press_time.get(button, 0) < debounce_seconds:
++            logger.debug(f"Ignoring debounced Inky button {button.upper()} press")
++            return
++        self.last_press_time[button] = now
++
++        button_actions = self.device_config.get_config("button_actions", default={})
++        action = button_actions.get(button, self.DEFAULT_BUTTON_ACTIONS.get(button))
++
++        # Simple actions are a plain string; "jump to plugin" and "switch playlist"
++        # carry extra parameters, so they're stored as a small dict instead.
++        if isinstance(action, dict):
++            action_type = action.get("type")
++        else:
++            action_type = action
++
++        if action_type == "next":
++            logger.info(f"Inky button {button.upper()} pressed; cycling to next plugin")
++            self.refresh_task.cycle_playlist_next()
++        elif action_type == "previous":
++            logger.info(f"Inky button {button.upper()} pressed; cycling to previous plugin")
++            self.refresh_task.cycle_playlist_previous()
++        elif action_type == "refresh":
++            logger.info(f"Inky button {button.upper()} pressed; forcing refresh of current plugin")
++            self.refresh_task.force_refresh_current()
++        elif action_type == "pause":
++            paused = self.refresh_task.toggle_pause()
++            logger.info(f"Inky button {button.upper()} pressed; playlist auto-cycling {'paused' if paused else 'resumed'}")
++        elif action_type == "plugin":
++            playlist_name, plugin_id, instance_name = action.get("playlist"), action.get("plugin_id"), action.get("instance")
++            if playlist_name and plugin_id and instance_name:
++                logger.info(f"Inky button {button.upper()} pressed; jumping to plugin '{instance_name}' in playlist '{playlist_name}'")
++                self.refresh_task.jump_to_plugin(playlist_name, plugin_id, instance_name)
++            else:
++                logger.warning(f"Inky button {button.upper()}: 'plugin' action is missing playlist/plugin_id/instance")
++        elif action_type == "plugin_type":
++            playlist_name, plugin_id = action.get("playlist"), action.get("plugin_id")
++            if playlist_name and plugin_id:
++                logger.info(f"Inky button {button.upper()} pressed; jumping to plugin type '{plugin_id}' in playlist '{playlist_name}'")
++                self.refresh_task.jump_to_plugin_type(playlist_name, plugin_id)
++            else:
++                logger.warning(f"Inky button {button.upper()}: 'plugin_type' action is missing playlist/plugin_id")
++        elif action_type == "playlist":
++            playlist_name = action.get("playlist")
++            if playlist_name:
++                logger.info(f"Inky button {button.upper()} pressed; switching to playlist '{playlist_name}'")
++                self.refresh_task.switch_to_playlist(playlist_name)
++            else:
++                logger.warning(f"Inky button {button.upper()}: 'playlist' action is missing a playlist name")
++        else:
++            logger.debug(f"Inky button {button.upper()} pressed; action '{action_type}' is a no-op")
++
++    def _close_request(self):
++        if self.request and hasattr(self.request, "release"):
++            try:
++                self.request.release()
++            except Exception as e:
++                logger.debug(f"Error while releasing Inky button GPIO request: {e}")
++        self.request = None
+diff --git a/src/inkypi.py b/src/inkypi.py
+index 5dc4de5..abe2600 100755
+--- a/src/inkypi.py
++++ b/src/inkypi.py
+@@ -25,6 +25,7 @@ from werkzeug.serving import is_running_from_reloader
+ from config import Config
+ from display.display_manager import DisplayManager
+ from refresh_task import RefreshTask
++from button_task import ButtonTask
+ from blueprints.main import main_bp
+ from blueprints.settings import settings_bp
+ from blueprints.plugin import plugin_bp
+@@ -63,6 +64,7 @@ app.jinja_loader = ChoiceLoader([FileSystemLoader(directory) for directory in te
+ device_config = Config()
+ display_manager = DisplayManager(device_config)
+ refresh_task = RefreshTask(device_config, display_manager)
++button_task = ButtonTask(device_config, refresh_task)
+ 
+ load_plugins(device_config.get_plugins())
+ 
+@@ -70,6 +72,7 @@ load_plugins(device_config.get_plugins())
+ app.config['DEVICE_CONFIG'] = device_config
+ app.config['DISPLAY_MANAGER'] = display_manager
+ app.config['REFRESH_TASK'] = refresh_task
++app.config['BUTTON_TASK'] = button_task
+ 
+ # Set additional parameters
+ app.config['MAX_FORM_PARTS'] = 10_000
+@@ -88,6 +91,7 @@ if __name__ == '__main__':
+ 
+     # start the background refresh task
+     refresh_task.start()
++    button_task.start()
+ 
+     # display default inkypi image on startup
+     if device_config.get_config("startup") is True:
+@@ -114,4 +118,5 @@ if __name__ == '__main__':
+ 
+         serve(app, host="0.0.0.0", port=PORT, threads=1)
+     finally:
++        button_task.stop()
+         refresh_task.stop()
+diff --git a/src/model.py b/src/model.py
+index df2f4b1..014bf6d 100644
+--- a/src/model.py
++++ b/src/model.py
+@@ -67,10 +67,13 @@ class PlaylistManager:
+     DEFAULT_PLAYLIST_START = "00:00"
+     DEFAULT_PLAYLIST_END = "24:00"
+ 
+-    def __init__(self, playlists=[], active_playlist=None):
++    def __init__(self, playlists=[], active_playlist=None, pinned_playlist=None):
+         """Initialize PlaylistManager with a list of playlists."""
+         self.playlists = playlists
+         self.active_playlist = active_playlist
++        # When set, overrides the time-based schedule below and pins this playlist
++        # as active until cleared (e.g. via a button's "switch playlist" action).
++        self.pinned_playlist = pinned_playlist
+ 
+     def get_playlist_names(self):
+         """Returns a list of all playlist names."""
+@@ -90,7 +93,14 @@ class PlaylistManager:
+         return None
+ 
+     def determine_active_playlist(self, current_datetime):
+-        """Determine the active playlist based on the current time."""
++        """Determine the active playlist based on the current time, unless a playlist is pinned."""
++        if self.pinned_playlist:
++            playlist = self.get_playlist(self.pinned_playlist)
++            if playlist:
++                return playlist
++            logger.warning(f"Pinned playlist '{self.pinned_playlist}' not found, clearing pin.")
++            self.pinned_playlist = None
++
+         current_time = current_datetime.strftime("%H:%M")  # Get current time in "HH:MM" format
+ 
+         # get active playlists that have plugins
+@@ -146,14 +156,16 @@ class PlaylistManager:
+     def to_dict(self):
+         return {
+             "playlists": [p.to_dict() for p in self.playlists],
+-            "active_playlist": self.active_playlist
++            "active_playlist": self.active_playlist,
++            "pinned_playlist": self.pinned_playlist
+         }
+ 
+     @classmethod
+     def from_dict(cls, data):
+         return cls(
+             playlists=[Playlist.from_dict(p) for p in data.get("playlists", [])],
+-            active_playlist=data.get("active_playlist")
++            active_playlist=data.get("active_playlist"),
++            pinned_playlist=data.get("pinned_playlist")
+         )
+ 
+     @staticmethod
+@@ -222,13 +234,31 @@ class Playlist:
+         """Find a plugin instance by its plugin_id and name."""
+         return next((p for p in self.plugins if p.plugin_id == plugin_id and p.name == name), None)
+ 
++    def set_current_plugin(self, plugin_id, name):
++        """Finds a plugin instance by its plugin_id and name, sets it as the current plugin
++        (updating current_plugin_index), and returns it. Returns None if not found."""
++        for index, plugin in enumerate(self.plugins):
++            if plugin.plugin_id == plugin_id and plugin.name == name:
++                self.current_plugin_index = index
++                return plugin
++        return None
++
+     def get_next_plugin(self):
+         """Returns the next plugin instance in the playlist and update the current_plugin_index."""
+         if self.current_plugin_index is None:
+             self.current_plugin_index = 0
+         else:
+             self.current_plugin_index = (self.current_plugin_index + 1) % len(self.plugins)
+-        
++
++        return self.plugins[self.current_plugin_index]
++
++    def get_previous_plugin(self):
++        """Returns the previous plugin instance in the playlist and update the current_plugin_index."""
++        if self.current_plugin_index is None:
++            self.current_plugin_index = 0
++        else:
++            self.current_plugin_index = (self.current_plugin_index - 1) % len(self.plugins)
++
+         return self.plugins[self.current_plugin_index]
+ 
+     def get_priority(self):
+diff --git a/src/refresh_task.py b/src/refresh_task.py
+index f554e2a..6feaee5 100644
+--- a/src/refresh_task.py
++++ b/src/refresh_task.py
+@@ -7,7 +7,7 @@ import pytz
+ from datetime import datetime, timezone
+ from plugins.plugin_registry import get_plugin_instance
+ from utils.image_utils import compute_image_hash
+-from model import RefreshInfo, PlaylistManager
++from model import RefreshInfo, PlaylistManager, PluginInstance
+ from PIL import Image
+ 
+ logger = logging.getLogger(__name__)
+@@ -24,6 +24,12 @@ class RefreshTask:
+         self.condition = threading.Condition(self.lock)
+         self.running = False
+         self.manual_update_request = ()
++        self.playlist_cycle_direction = None
++        self.force_refresh_requested = False
++        self.paused = False
++        self.jump_target = None  # (playlist_name, plugin_id, instance_name)
++        self.jump_type_target = None  # (playlist_name, plugin_id)
++        self.playlist_switch_target = None  # playlist_name
+ 
+         self.refresh_event = threading.Event()
+         self.refresh_event.set()
+@@ -94,16 +100,91 @@ class RefreshTask:
+                         logger.info("Manual update requested")
+                         refresh_action = self.manual_update_request
+                         self.manual_update_request = ()
++                    elif self.jump_target:
++                        # handle a button-triggered jump to a specific plugin instance
++                        playlist_name, plugin_id, instance_name = self.jump_target
++                        self.jump_target = None
++                        logger.info(f"Manual jump to plugin requested. | playlist: {playlist_name} | plugin: {plugin_id}/{instance_name}")
++                        playlist = playlist_manager.get_playlist(playlist_name)
++                        plugin_instance = playlist.set_current_plugin(plugin_id, instance_name) if playlist else None
++                        if playlist and plugin_instance:
++                            playlist_manager.active_playlist = playlist.name
++                            refresh_action = PlaylistRefresh(playlist, plugin_instance, force=True)
++                        else:
++                            logger.warning(f"Could not find plugin '{plugin_id}/{instance_name}' in playlist '{playlist_name}'.")
++                    elif self.jump_type_target:
++                        # handle a button-triggered jump to a plugin type, regardless of instance;
++                        # reuses an existing instance of that type if one exists, otherwise creates
++                        # a new default-settings instance on the fly.
++                        playlist_name, plugin_id = self.jump_type_target
++                        self.jump_type_target = None
++                        logger.info(f"Manual jump to plugin type requested. | playlist: {playlist_name} | plugin_id: {plugin_id}")
++                        playlist = playlist_manager.get_playlist(playlist_name)
++                        if not playlist:
++                            logger.warning(f"Playlist '{playlist_name}' not found.")
++                        else:
++                            plugin_instance = next((p for p in playlist.plugins if p.plugin_id == plugin_id), None)
++                            if not plugin_instance:
++                                plugin_config = self.device_config.get_plugin(plugin_id)
++                                if not plugin_config:
++                                    logger.warning(f"Plugin type '{plugin_id}' is not installed/registered.")
++                                else:
++                                    instance_name = self._unique_instance_name(playlist, plugin_config.get("display_name", plugin_id))
++                                    plugin_instance = PluginInstance(plugin_id, instance_name, {}, {})
++                                    playlist.plugins.append(plugin_instance)
++                                    logger.info(f"Auto-created new '{plugin_id}' instance '{instance_name}' in playlist '{playlist_name}'")
++                            if plugin_instance:
++                                playlist.current_plugin_index = playlist.plugins.index(plugin_instance)
++                                playlist_manager.active_playlist = playlist.name
++                                refresh_action = PlaylistRefresh(playlist, plugin_instance, force=True)
++                    elif self.playlist_switch_target:
++                        # handle a button-triggered switch to a different (pinned) playlist
++                        playlist_name = self.playlist_switch_target
++                        self.playlist_switch_target = None
++                        logger.info(f"Manual playlist switch requested. | playlist: {playlist_name}")
++                        if playlist_manager.get_playlist(playlist_name):
++                            playlist_manager.pinned_playlist = playlist_name
++                            playlist, plugin_instance = self._determine_next_plugin(
++                                playlist_manager, latest_refresh, current_dt, ignore_cycle_interval=True
++                            )
++                            if plugin_instance:
++                                refresh_action = PlaylistRefresh(playlist, plugin_instance, force=True)
++                        else:
++                            logger.warning(f"Playlist '{playlist_name}' not found, ignoring switch request.")
++                    elif self.playlist_cycle_direction:
++                        # handle a button-triggered next/previous cycle
++                        direction = self.playlist_cycle_direction
++                        self.playlist_cycle_direction = None
++                        logger.info(f"Manual playlist cycle requested. | direction: {direction}")
++                        playlist, plugin_instance = self._determine_next_plugin(
++                            playlist_manager, latest_refresh, current_dt,
++                            ignore_cycle_interval=True, reverse=(direction == "previous")
++                        )
++                        if plugin_instance:
++                            refresh_action = PlaylistRefresh(playlist, plugin_instance, force=True)
++                    elif self.force_refresh_requested:
++                        # handle a button-triggered refresh of the current plugin (no advance)
++                        self.force_refresh_requested = False
++                        logger.info("Manual force-refresh of current plugin requested")
++                        playlist = playlist_manager.determine_active_playlist(current_dt)
++                        if playlist and playlist.plugins and playlist.current_plugin_index is not None:
++                            plugin_instance = playlist.plugins[playlist.current_plugin_index]
++                            refresh_action = PlaylistRefresh(playlist, plugin_instance, force=True)
++                        else:
++                            logger.info("No current plugin to force-refresh.")
+                     else:
+ 
+                         if self.device_config.get_config("log_system_stats"):
+                             self.log_system_stats()
+ 
+                         # handle refresh based on playlists
+-                        logger.info(f"Running interval refresh check. | current_time: {current_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+-                        playlist, plugin_instance = self._determine_next_plugin(playlist_manager, latest_refresh, current_dt)
+-                        if plugin_instance:
+-                            refresh_action = PlaylistRefresh(playlist, plugin_instance)
++                        if self.paused:
++                            logger.info("Refresh task is paused; skipping interval refresh check.")
++                        else:
++                            logger.info(f"Running interval refresh check. | current_time: {current_dt.strftime('%Y-%m-%d %H:%M:%S')}")
++                            playlist, plugin_instance = self._determine_next_plugin(playlist_manager, latest_refresh, current_dt)
++                            if plugin_instance:
++                                refresh_action = PlaylistRefresh(playlist, plugin_instance)
+ 
+                     if refresh_action:
+                         plugin_config = self.device_config.get_plugin(refresh_action.get_plugin_id())
+@@ -149,6 +230,122 @@ class RefreshTask:
+         else:
+             logger.warning("Background refresh task is not running, unable to do a manual update")
+ 
++    def cycle_playlist_next(self, wait=False):
++        """Request an immediate cycle to the next plugin in the active playlist."""
++        return self._request_playlist_cycle("next", wait)
++
++    def cycle_playlist_previous(self, wait=False):
++        """Request an immediate cycle to the previous plugin in the active playlist."""
++        return self._request_playlist_cycle("previous", wait)
++
++    def _request_playlist_cycle(self, direction, wait):
++        if self.running:
++            with self.condition:
++                self.playlist_cycle_direction = direction
++                self.refresh_result = {}
++                self.refresh_event.clear()
++                self.condition.notify_all()
++
++            if wait:
++                self.refresh_event.wait()
++                if self.refresh_result.get("exception"):
++                    raise self.refresh_result.get("exception")
++            return True
++
++        logger.warning("Background refresh task is not running, unable to cycle playlist")
++        return False
++
++    def force_refresh_current(self, wait=False):
++        """Request an immediate re-render of the currently active plugin instance, without advancing it."""
++        if self.running:
++            with self.condition:
++                self.force_refresh_requested = True
++                self.refresh_result = {}
++                self.refresh_event.clear()
++                self.condition.notify_all()
++
++            if wait:
++                self.refresh_event.wait()
++                if self.refresh_result.get("exception"):
++                    raise self.refresh_result.get("exception")
++            return True
++
++        logger.warning("Background refresh task is not running, unable to force refresh")
++        return False
++
++    def toggle_pause(self):
++        """Toggle automatic interval-based playlist cycling on/off. Button-triggered actions still work while paused."""
++        self.paused = not self.paused
++        logger.info(f"Refresh task {'paused' if self.paused else 'resumed'}")
++        return self.paused
++
++    def jump_to_plugin(self, playlist_name, plugin_id, instance_name, wait=False):
++        """Request an immediate jump to a specific plugin instance within a specific playlist."""
++        if self.running:
++            with self.condition:
++                self.jump_target = (playlist_name, plugin_id, instance_name)
++                self.refresh_result = {}
++                self.refresh_event.clear()
++                self.condition.notify_all()
++
++            if wait:
++                self.refresh_event.wait()
++                if self.refresh_result.get("exception"):
++                    raise self.refresh_result.get("exception")
++            return True
++
++        logger.warning("Background refresh task is not running, unable to jump to plugin")
++        return False
++
++    def jump_to_plugin_type(self, playlist_name, plugin_id, wait=False):
++        """Request an immediate jump to a plugin type within a specific playlist, reusing an
++        existing instance of that type if one exists, otherwise creating one on the fly."""
++        if self.running:
++            with self.condition:
++                self.jump_type_target = (playlist_name, plugin_id)
++                self.refresh_result = {}
++                self.refresh_event.clear()
++                self.condition.notify_all()
++
++            if wait:
++                self.refresh_event.wait()
++                if self.refresh_result.get("exception"):
++                    raise self.refresh_result.get("exception")
++            return True
++
++        logger.warning("Background refresh task is not running, unable to jump to plugin type")
++        return False
++
++    def _unique_instance_name(self, playlist, base_name):
++        """Returns base_name if unused in the playlist, otherwise base_name with a
++        disambiguating counter appended (e.g. 'Weather (2)')."""
++        existing_names = {p.name for p in playlist.plugins}
++        if base_name not in existing_names:
++            return base_name
++        i = 2
++        while f"{base_name} ({i})" in existing_names:
++            i += 1
++        return f"{base_name} ({i})"
++
++    def switch_to_playlist(self, playlist_name, wait=False):
++        """Request an immediate switch to a specific playlist, pinning it as active
++        (overriding the time-based schedule) until switched again."""
++        if self.running:
++            with self.condition:
++                self.playlist_switch_target = playlist_name
++                self.refresh_result = {}
++                self.refresh_event.clear()
++                self.condition.notify_all()
++
++            if wait:
++                self.refresh_event.wait()
++                if self.refresh_result.get("exception"):
++                    raise self.refresh_result.get("exception")
++            return True
++
++        logger.warning("Background refresh task is not running, unable to switch playlist")
++        return False
++
+     def signal_config_change(self):
+         """Notify the background thread that config has changed (e.g., interval updated)."""
+         if self.running:
+@@ -160,7 +357,7 @@ class RefreshTask:
+         tz_str = self.device_config.get_config("timezone", default="UTC")
+         return datetime.now(pytz.timezone(tz_str))
+ 
+-    def _determine_next_plugin(self, playlist_manager, latest_refresh_info, current_dt):
++    def _determine_next_plugin(self, playlist_manager, latest_refresh_info, current_dt, ignore_cycle_interval=False, reverse=False):
+         """Determines the next plugin to refresh based on the active playlist, plugin cycle interval, and current time."""
+         playlist = playlist_manager.determine_active_playlist(current_dt)
+         if not playlist:
+@@ -175,14 +372,14 @@ class RefreshTask:
+ 
+         latest_refresh_dt = latest_refresh_info.get_refresh_datetime()
+         plugin_cycle_interval = self.device_config.get_config("plugin_cycle_interval_seconds", default=3600)
+-        should_refresh = PlaylistManager.should_refresh(latest_refresh_dt, plugin_cycle_interval, current_dt)
++        should_refresh = ignore_cycle_interval or PlaylistManager.should_refresh(latest_refresh_dt, plugin_cycle_interval, current_dt)
+ 
+         if not should_refresh:
+             latest_refresh_str = latest_refresh_dt.strftime('%Y-%m-%d %H:%M:%S') if latest_refresh_dt else "None"
+             logger.info(f"Not time to update display. | latest_update: {latest_refresh_str} | plugin_cycle_interval: {plugin_cycle_interval}")
+             return None, None
+ 
+-        plugin = playlist.get_next_plugin()
++        plugin = playlist.get_previous_plugin() if reverse else playlist.get_next_plugin()
+         logger.info(f"Determined next plugin. | active_playlist: {playlist.name} | plugin_instance: {plugin.name}")
+ 
+         return playlist, plugin
+diff --git a/src/templates/settings.html b/src/templates/settings.html
+index 27253a8..30a7047 100644
+--- a/src/templates/settings.html
++++ b/src/templates/settings.html
+@@ -94,7 +95,18 @@
+             const valueDisplay = document.getElementById(`${slider.id}-value`);
+             valueDisplay.textContent = parseFloat(slider.value).toFixed(1);
+         }
++
++        function updateButtonTargetVisibility(actionSelect) {
++            const targetSelect = document.getElementById(actionSelect.id.replace('_action', '_target'));
++            if (!targetSelect) return;
++            targetSelect.closest('.form-group').style.display = actionSelect.value === 'goto' ? '' : 'none';
++        }
++
++        function initButtonTargetVisibility() {
++            document.querySelectorAll('.button-action-select').forEach(updateButtonTargetVisibility);
++        }
+         document.addEventListener('DOMContentLoaded', populateIntervalFields);
++        document.addEventListener('DOMContentLoaded', initButtonTargetVisibility);
+     </script>
+ </head>
+ <body>
+@@ -273,6 +285,73 @@
+                         {% endif %}
+                     </div>
+                 </div>
++
++                {% if device_settings.get('display_type', 'inky') == 'inky' %}
++                {% set button_actions = device_settings.get('button_actions', {}) %}
++                <div class="collapsible">
++                    <button type="button" class="collapsible-header" onclick="toggleCollapsible(this)">
++                        Hardware Buttons <span class="collapsible-icon">▼</span>
++                    </button>
++                    <div class="settings-container collapsible-content">
++                        {% for btn_key, btn_label, default_action in [('a', 'Button A', 'next'), ('b', 'Button B', 'previous'), ('c', 'Button C', 'refresh'), ('d', 'Button D', 'pause')] %}
++                        {% set raw_action = button_actions.get(btn_key, default_action) %}
++                        {% if raw_action is mapping %}
++                            {% set action_value = 'goto' %}
++                            {% if raw_action.type == 'playlist' %}
++                                {% set target_value = 'playlist|' + raw_action.playlist %}
++                            {% elif raw_action.type == 'plugin_type' %}
++                                {% set target_value = 'plugintype|' + raw_action.playlist + '|' + raw_action.plugin_id %}
++                            {% else %}
++                                {% set target_value = 'plugin|' + raw_action.playlist + '|' + raw_action.plugin_id + '|' + raw_action.instance %}
++                            {% endif %}
++                        {% else %}
++                            {% set action_value = raw_action %}
++                            {% set target_value = '' %}
++                        {% endif %}
++                        <div class="form-group">
++                            <label for="button_{{ btn_key }}_action" class="form-label" style="min-width: 100px;">{{ btn_label }}:</label>
++                            <select id="button_{{ btn_key }}_action" name="button_{{ btn_key }}_action" class="form-input button-action-select" onchange="updateButtonTargetVisibility(this)">
++                                <option value="next" {% if action_value == "next" %}selected{% endif %}>Next plugin</option>
++                                <option value="previous" {% if action_value == "previous" %}selected{% endif %}>Previous plugin</option>
++                                <option value="refresh" {% if action_value == "refresh" %}selected{% endif %}>Refresh current</option>
++                                <option value="pause" {% if action_value == "pause" %}selected{% endif %}>Pause/resume auto-cycle</option>
++                                <option value="goto" {% if action_value == "goto" %}selected{% endif %}>Go to playlist/plugin...</option>
++                                <option value="none" {% if action_value == "none" %}selected{% endif %}>Do nothing</option>
++                            </select>
++                        </div>
++                        <div class="form-group">
++                            <label for="button_{{ btn_key }}_target" class="form-label" style="min-width: 100px;"></label>
++                            <select id="button_{{ btn_key }}_target" name="button_{{ btn_key }}_target" class="form-input">
++                                <option value="">— select a playlist or plugin —</option>
++                                {% for playlist in playlists_for_buttons %}
++                                <optgroup label="{{ playlist.name }}">
++                                    <option value="playlist|{{ playlist.name }}" {% if target_value == "playlist|" + playlist.name %}selected{% endif %}>Whole playlist (auto-cycle)</option>
++                                    {% for p in playlist.plugins %}
++                                    <option value="plugin|{{ playlist.name }}|{{ p.plugin_id }}|{{ p.instance }}" {% if target_value == "plugin|" + playlist.name + "|" + p.plugin_id + "|" + p.instance %}selected{% endif %}>{{ p.display_name }}: {{ p.instance }}</option>
++                                    {% endfor %}
++                                    {% for pt in all_plugin_types %}
++                                    <option value="plugintype|{{ playlist.name }}|{{ pt.plugin_id }}" {% if target_value == "plugintype|" + playlist.name + "|" + pt.plugin_id %}selected{% endif %}>+ New {{ pt.display_name }}</option>
++                                    {% endfor %}
++                                </optgroup>
++                                {% endfor %}
++                            </select>
++                        </div>
++                        {% endfor %}
++                        <div class="form-group">
++                            <label for="button_debounce_seconds" class="form-label" style="min-width: 100px;">Button Debounce (seconds):</label>
++                            <input
++                                type="number"
++                                id="button_debounce_seconds"
++                                name="button_debounce_seconds"
++                                class="form-input"
++                                min="0" step="0.1"
++                                value="{{ device_settings.get('button_debounce_seconds', 1.0) }}"
++                                style="max-width: 150px;"
++                            />
++                        </div>
++                    </div>
++                </div>
++                {% endif %}
+             </div>
+         </form>
+  
